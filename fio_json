@@ -1,0 +1,149 @@
+#!/usr/bin/env python3
+
+import argparse
+import sys
+from os import getuid
+from pwd import getpwuid
+import json
+from datetime import datetime, timezone
+
+
+def main():
+    argp = argparse.ArgumentParser()
+    argp.add_argument('--output', '-o', type = argparse.FileType('w'), default = '-')
+    argp.add_argument('--input', '-i', type = argparse.FileType('r'), default = '-')
+    argp.add_argument('--sutinfo', type = argparse.FileType('r'))
+    argp.add_argument('--event', '--event-id', '--id', type = str)
+    argp.add_argument('--name', type = str, default = "fio-unknown")
+    argp.add_argument('--time', type = str, default = datetime.utcnow().isoformat())
+    argp.add_argument('--resultonly', action = 'store_true')
+    argp.add_argument('--submitter-name', type = str, default = get_logname())
+    argp.add_argument('--submitter-email', type = str, default = '{}@sppo.amd.com'.format(get_logname()))
+
+    args = argp.parse_args()
+    
+
+    if not args.resultonly and not (args.sutinfo and args.event):
+        print("Preparation of a transaction for Steward requires both a sutinfo JSON file (--sutinfo) and an event "
+              "ID (--event).", file = sys.stderr)
+        sys.exit(1)
+
+    # Load the result data. Reference format is at
+    # http://confluence.amd.com/display/ES/FIO+JSON+Schema
+    fio_data = json.load(args.input)
+    
+    # Save list of all NVMe's tested
+    # if FIO group_reporting is enabled, disk_util is the only field that contains list of the NVMEs tested
+    disk_util_info = fio_data ['disk_util']
+    fio_nvmes = [item['name'] for item in disk_util_info]
+    multi_filenames = ' '.join(fio_nvmes)
+    
+    fio_required_items = ('fio version','rw', 'direct', 'iodepth', 'bs', 'ioengine', 'filename', 'ramp_time', 'runtime', 'numjobs', 'bw', 'iops', 'usr_cpu', 'sys_cpu')
+    fio_data_items = dict.fromkeys(fio_required_items)
+
+    #Calling function with fio_data dictionary and required items to be parsed. Finally we will get the parsed fio json (fio_data_items), this is
+    #being used in the subsequent functions.
+    fio_parser(fio_data,fio_data_items)
+    fio_data_items['filename'] = multi_filenames # for multiple nvme's
+    fio_data_items = { x.replace(" ", "_"): v  
+                   for x, v in fio_data_items.items()}
+    fio_data_items = { 'fio': fio_data_items }
+   
+
+    if args.resultonly:
+        json.dump(fio_data_items, args.output, indent = 2, sort_keys = True)
+        args.output.write("\n")  # Add the trailing newline that some programs and people want to see
+
+        print("Wrote '{}' containing just the stream result JSON.".format(args.output), file = sys.stderr)
+
+    else:
+        # Read the sutinfo JSON file
+        sutinfo_data = json.load(args.sutinfo)
+
+        # Dump (to args.output) the dict that results from mashing the dicts together.
+        json.dump(construct_steward_json(sutinfo_data, fio_data_items, args.name, args.event, args.time,
+                                         args.submitter_name, args.submitter_email),
+                  args.output,
+                  indent = 2,
+                  sort_keys = True)
+        args.output.write("\n")  # Add the trailing newline that some programs and people want to see
+
+        print("Wrote '{}' containing the full Steward JSON output for '{}'.".format(args.output, args.event),
+              file = sys.stderr)
+
+
+def get_logname(uid = getuid()):
+    try:
+        return getpwuid(uid)[0]
+    except KeyError:
+        return str(uid)
+
+
+def construct_steward_json(sutinfo_dict, fio_data_items, test_name, event_id, start_time, submitter_name,
+                           submitter_email):
+    steward_dict = {
+        'test_dimensions':      sutinfo_dict.get('test_dimensions', {}),
+        'sut_dimensions':       sutinfo_dict.get('sut_dimensions', {}),
+        'system_configuration': sutinfo_dict.get('system_configuration', {}),
+    }
+    steward_dict['test_dimensions'].update({
+        'test_name':            test_name,
+        'iteration_name':       event_id,
+        'iteration_start_date': start_time,
+        'submitter_name':       submitter_name,
+        'submitter_email':      submitter_email,
+    })
+    steward_dict.update(fio_data_items)
+
+    steward_dict = { d.replace(' ','_') : e
+                 for d, e in steward_dict.items()}
+
+    return steward_dict
+
+def fio_parser(fio_data,fio_data_items):
+    
+    # Get the type of operation (read or write) and exract the relevant performance section
+    rw_operation = fio_data['global options']['rw']
+    if (rw_operation == 'read') or (rw_operation == 'randread'):
+        read_write_section = fio_data['jobs'][0]['read']
+    elif (rw_operation == 'write') or (rw_operation == 'randwrite'):
+        read_write_section = fio_data['jobs'][0]['write']
+    else:
+        sys.exit("Invalid FIO operation!")
+    
+    for item in fio_data_items:
+
+        if item in fio_data :
+            fio_value = fio_data[item]
+        elif item in fio_data['global options'] :
+            fio_value = fio_data['global options'][item]
+        elif item in fio_data['jobs'][0] :
+            fio_value = fio_data['jobs'][0][item]
+        elif item in fio_data['jobs'][0]['job options'] :
+            fio_value = fio_data['jobs'][0]['job options'][item]
+        elif item in read_write_section :
+            fio_value = read_write_section[item]
+        elif item in fio_data['jobs'][0] :
+            fio_value = fio_data['jobs'][0][item]
+        else:
+            print("Failed due to unavailability of the data item '{}' in fio dictionary".format(item))
+            fio_value=None
+        fio_data_items.update({item: fio_value})
+
+    # Capturing slat_ns and clat_ns values explicitly
+
+    if read_write_section['slat_ns']['mean']:
+       fio_data_items["slat_ns_mean"] = read_write_section['slat_ns']['mean']
+    else:
+       print("Failed due to unavailability of the data item 'slat_ns mean' in fio dictionary")
+       fio_data_items["slat_ns_mean"] = None
+
+    if read_write_section['clat_ns']['mean']:
+       fio_data_items["clat_ns_mean"] = read_write_section['clat_ns']['mean']
+    else:
+       print("Failed due to unavailability of the data item 'clat_ns mean' in fio dictionary")
+       fio_data_items["clat_ns_mean"] = None
+
+
+if __name__ == "__main__":
+    main()
